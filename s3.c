@@ -67,6 +67,10 @@ void launch_program(char *args[], int argsc)
     ///Handle the 'exit' command;
     ///so that the shell, not the child process,
     ///exits.
+    if (argsc == 0) {
+    return;
+    }
+    
     if (argsc > 0 && strcmp(args[0], "exit") == 0) {
         exit(0);
     }
@@ -87,3 +91,100 @@ void launch_program(char *args[], int argsc)
         child(args, argsc);
     }
 }
+
+void launch_program_with_redirection(char *args[], int argsc){
+    char *clean_args[MAX_ARGS];
+    int cleanc = 0;
+    char *infile = NULL;
+    char *outfile = NULL;
+    int append = 0;
+
+    for (int i= 0; i<argsc; ++i){
+        if(strcmp(args[i], "<") == 0){
+            if(i + 1>= argsc) {
+                fprintf(stderr, "syntax error");
+                return;
+            }
+            infile = args[i+1];
+            ++i;
+            continue;
+        }
+        if(strcmp(args[i], ">>") == 0){
+            if (i+1 >= argsc){
+                fprintf(stderr, "syntax error");
+                return;
+            }
+            outfile = args[i+1];
+            append = 1;
+            ++i;
+            continue;
+        }
+        if (strcmp(args[i], ">") == 0) {
+            if (i +1 >= argsc){
+                fprintf(stderr, "syntax error");
+                return;
+            }
+            outfile = args[++i];
+            append = 0;
+            continue;
+        }
+        if (cleanc < MAX_ARGS - 1){
+            clean_args[cleanc++] = args[i];
+        }
+    }
+
+    clean_args[cleanc] = NULL;
+    if (cleanc == 0){
+        return;
+    }
+
+    pid_t rc = fork();
+    if (rc < 0){
+        perror("fork failed");
+        exit(1);
+    }
+    else if (rc == 0) {
+        if (infile) {
+            int fd_in = open(infile, O_RDONLY);
+            if(fd_in < 0) {
+                perror("error input");
+                exit(1);
+            }
+            if(dup2(fd_in, STDIN_FILENO) < 0){
+                perror("dup2 stdin");
+                exit(1);
+            }
+            close(fd_in);
+        }
+
+        if(outfile){
+            int flags = O_WRONLY | O_CREAT | (append ? O_APPEND : O_TRUNC);
+            int fd_out = open(outfile, flags, 0644);
+            if (fd_out < 0){
+                perror("output open");
+                exit(1);
+            }
+            if (dup2(fd_out, STDOUT_FILENO) < 0){
+                perror("dup2 out");
+                exit(1);
+            }
+            close(fd_out);
+        }
+
+        execvp(clean_args[0], clean_args);
+        perror("execvp failed");
+        exit(1);
+    }
+
+
+}
+
+bool command_with_redirection(const char line[]){
+    char *args[MAX_ARGS];
+    int argsc;
+    parse_command(line, args, &argsc);
+    launch_program_with_redirection(args, argsc);
+    reap();
+
+}
+
