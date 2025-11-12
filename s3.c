@@ -1,4 +1,6 @@
 #include "s3.h"
+#include <errno.h>
+#include <limits.h>
 
 ///Simple for now, but will be expanded in a following section
 void construct_shell_prompt(char shell_prompt[])
@@ -92,99 +94,189 @@ void launch_program(char *args[], int argsc)
     }
 }
 
-void launch_program_with_redirection(char *args[], int argsc){
+typedef enum { R_IN, R_OUT_TRUNC, R_OUT_APPEND } RedirType;
+typedef struct { RedirType type; char *file; } Redir;
+
+void launch_program_with_redirection(char *args[], int argsc) {
+
+    Redir redirs[16];
+    int nredirs = 0;
+
     char *clean_args[MAX_ARGS];
     int cleanc = 0;
-    char *infile = NULL;
-    char *outfile = NULL;
-    int append = 0;
 
-    for (int i= 0; i<argsc; ++i){
-        if(strcmp(args[i], "<") == 0){
-            if(i + 1>= argsc) {
-                fprintf(stderr, "syntax error");
-                return;
+    for (int i = 0; i < argsc; ++i) {
+        if (strcmp(args[i], "<") == 0) {
+            if (i + 1 >= argsc) { 
+                fprintf(stderr, "syntax error\n");
+                return; 
             }
-            infile = args[i+1];
+            if (nredirs < (int)(sizeof redirs / sizeof redirs[0])) 
+            {
+                redirs[nredirs++] = (Redir){ R_IN, args[i+1] };
+            }
             ++i;
             continue;
         }
-        if(strcmp(args[i], ">>") == 0){
-            if (i+1 >= argsc){
-                fprintf(stderr, "syntax error");
-                return;
+        if (strcmp(args[i], ">>") == 0) {
+            if (i + 1 >= argsc) { 
+                fprintf(stderr, "syntax error: '>>' needs a filename\n");
+                return; 
             }
-            outfile = args[i+1];
-            append = 1;
+            if (nredirs < (int)(sizeof redirs / sizeof redirs[0])) {
+                redirs[nredirs++] = (Redir){ R_OUT_APPEND, args[i+1] };
+            }
             ++i;
             continue;
         }
         if (strcmp(args[i], ">") == 0) {
-            if (i +1 >= argsc){
-                fprintf(stderr, "syntax error");
-                return;
+            if (i + 1 >= argsc) {
+                fprintf(stderr, "syntax error: '>' needs a filename\n");
+                return; 
             }
-            outfile = args[++i];
-            append = 0;
+            if (nredirs < (int)(sizeof redirs / sizeof redirs[0])) {
+                redirs[nredirs++] = (Redir){ R_OUT_TRUNC, args[i+1] };
+            }
+            ++i;
             continue;
         }
-        if (cleanc < MAX_ARGS - 1){
+        if (cleanc < MAX_ARGS - 1) {
             clean_args[cleanc++] = args[i];
         }
     }
-
     clean_args[cleanc] = NULL;
-    if (cleanc == 0){
-        return;
-    }
+    if (cleanc == 0) return;
 
     pid_t rc = fork();
-    if (rc < 0){
-        perror("fork failed");
-        exit(1);
-    }
+    if (rc < 0) { perror("fork failed"); exit(1); }
     else if (rc == 0) {
-        if (infile) {
-            int fd_in = open(infile, O_RDONLY);
-            if(fd_in < 0) {
-                perror("error input");
-                exit(1);
+        for (int r = 0; r < nredirs; ++r) {
+            if (redirs[r].type == R_IN) {
+                int fd = open(redirs[r].file, O_RDONLY);
+                if (fd < 0) { 
+                    perror("open input"); exit(1);
+                }
+                if (dup2(fd, STDIN_FILENO) < 0) { 
+                    perror("dup2 stdin"); exit(1);
+                }
+                close(fd);
+            } else if (redirs[r].type == R_OUT_TRUNC) {
+                int fd = open(redirs[r].file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                if (fd < 0) { 
+                    perror("open output"); exit(1);
+                }
+                if (dup2(fd, STDOUT_FILENO) < 0) {
+                    perror("dup2 stdout"); exit(1);
+                }
+                close(fd);
+            } else {
+                int fd = open(redirs[r].file, O_WRONLY | O_CREAT | O_APPEND, 0644);
+                if (fd < 0) {
+                    perror("open output"); exit(1);
+                }
+                if (dup2(fd, STDOUT_FILENO) < 0) {
+                    perror("dup2 stdout"); exit(1);
+                }
+                close(fd);
             }
-            if(dup2(fd_in, STDIN_FILENO) < 0){
-                perror("dup2 stdin");
-                exit(1);
-            }
-            close(fd_in);
         }
-
-        if(outfile){
-            int flags = O_WRONLY | O_CREAT | (append ? O_APPEND : O_TRUNC);
-            int fd_out = open(outfile, flags, 0644);
-            if (fd_out < 0){
-                perror("output open");
-                exit(1);
-            }
-            if (dup2(fd_out, STDOUT_FILENO) < 0){
-                perror("dup2 out");
-                exit(1);
-            }
-            close(fd_out);
-        }
-
         execvp(clean_args[0], clean_args);
         perror("execvp failed");
         exit(1);
     }
 
-
 }
 
-bool command_with_redirection(const char line[]){
-    char *args[MAX_ARGS];
-    int argsc;
-    parse_command(line, args, &argsc);
-    launch_program_with_redirection(args, argsc);
-    reap();
 
+bool command_with_redirection(const char line[]) {
+    for (const char *p = line; *p; ++p) {
+        if (*p == '<' || *p == '>') return true;
+    }
+    return false;
 }
 
+
+bool is_cd(const char *line)
+{
+    while (*line == ' ' || *line == '\t') line++;
+    return (line[0] == 'c' && line[1] == 'd' &&
+            (line[2] == '\0' || line[2] == ' ' || line[2] == '\t'));
+}
+
+void init_lwd(char *lwd)
+{
+    char cwd[PATH_MAX];
+    if (getcwd(cwd, sizeof(cwd)) != NULL) {
+
+        snprintf(lwd, MAX_PROMPT_LEN - 6, "%s", cwd);
+    } else {
+        lwd[0] = '\0';
+    }
+}
+
+void run_cd(char *args[], int argsc, char *lwd)
+{
+    char old[PATH_MAX];
+    if (getcwd(old, sizeof(old)) == NULL) {
+        perror("getcwd");
+        return;
+    }
+
+    if (argsc == 1) {
+        char *home = getenv("HOME");
+        if (!home) {
+            fprintf(stderr, "cd: HOME not set\n");
+            return;
+        }
+        if (chdir(home) != 0) {
+            perror("cd");
+            return;
+        }
+        snprintf(lwd, MAX_PROMPT_LEN - 6, "%s", old);
+        return;
+    }
+
+    if (strcmp(args[1], "-") == 0) {
+        if (lwd[0] == '\0') {
+            fprintf(stderr, "cd: OLDPWD not set\n");
+            return;
+        }
+        if (chdir(lwd) != 0) {
+            perror("cd");
+            return;
+        }
+        printf("%s\n", lwd);
+        fflush(stdout);
+        snprintf(lwd, MAX_PROMPT_LEN - 6, "%s", old);
+        return;
+    }
+    if (args[1][0] == '~') {
+        char path[PATH_MAX];
+        char *home = getenv("HOME");
+
+        if (!home) {
+            fprintf(stderr, "cd: HOME not set\n");
+            return;
+        }
+        if (args[1][1] == '\0') {
+            snprintf(path, sizeof(path), "%s", home);
+        }
+        else if (args[1][1] == '/') {
+            snprintf(path, sizeof(path), "%s%s", home, args[1] + 1);
+        } else {
+            snprintf(path, sizeof(path), "%s", args[1]);
+        }
+
+        if (chdir(path) != 0) {
+            perror("cd");
+            return;
+        }
+        snprintf(lwd, MAX_PROMPT_LEN - 6, "%s", old);
+        return;
+    }
+    if (chdir(args[1]) != 0) {
+        perror("cd");
+        return;
+    }
+    snprintf(lwd, MAX_PROMPT_LEN - 6, "%s", old);
+}
