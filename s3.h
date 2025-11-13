@@ -59,4 +59,12 @@ void run_cd(char *args[], int argsc, char *lwd);
 void init_lwd(char *lwd);
 
 int execute_batch(char *line, char *lwd);
+
+//piping
+bool command_has_pipe(const char *line);
+int split_pipeline(char *line, char *stages[], int max_stages);
+void launch_pipeline(char line[]);
+ 
+//shared child w/ optional fds + redirection parsing ---
+void child_with_io_and_redirection(char *args[], int argsc, int in_fd, int out_fd);
 #endif

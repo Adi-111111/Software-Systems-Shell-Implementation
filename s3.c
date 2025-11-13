@@ -331,6 +331,151 @@ static int split_on_semicolons_(char *line, char *out[], int max_out){
     }
     return count;
 }
+//ectras
+
+static void parse_redirs(char *args[], int argsc,
+                         char *clean_args[], int *cleanc,
+                         char **infile, char **outfile, int *append)
+{
+    *cleanc = 0;
+    *infile = NULL;
+    *outfile = NULL;
+    *append = 0;
+ 
+    for (int i = 0; i < argsc; ++i) {
+        if (strcmp(args[i], "<") == 0) {
+            if (i + 1 >= argsc) { fprintf(stderr, "syntax error\n"); return; }
+            *infile = args[++i];
+            continue;
+        }
+        if (strcmp(args[i], ">>") == 0) {
+            if (i + 1 >= argsc) { fprintf(stderr, "syntax error\n"); return; }
+            *outfile = args[++i];
+            *append = 1;
+            continue;
+        }
+        if (strcmp(args[i], ">") == 0) {
+            if (i + 1 >= argsc) { fprintf(stderr, "syntax error\n"); return; }
+            *outfile = args[++i];
+            *append = 0;
+            continue;
+        }
+        if (*cleanc < MAX_ARGS - 1) clean_args[(*cleanc)++] = args[i];
+    }
+    clean_args[*cleanc] = NULL;
+}
+ 
+void child_with_io_and_redirection(char *args[], int argsc, int in_fd, int out_fd)
+{
+    char *clean_args[MAX_ARGS];
+    int cleanc = 0;
+    char *infile = NULL, *outfile = NULL;
+    int append = 0;
+    parse_redirs(args, argsc, clean_args, &cleanc, &infile, &outfile, &append);
+ 
+    // Pipeline-provided fds first
+    if (in_fd != -1) {
+        if (dup2(in_fd, STDIN_FILENO) < 0) { perror("dup2 stdin"); exit(1); }
+    }
+    if (out_fd != -1) {
+        if (dup2(out_fd, STDOUT_FILENO) < 0) { perror("dup2 stdout"); exit(1); }
+    }
+ 
+    // Then explicit redirections override
+    if (infile) {
+        int fd_in = open(infile, O_RDONLY);
+        if (fd_in < 0) { perror("open <"); exit(1); }
+        if (dup2(fd_in, STDIN_FILENO) < 0) { perror("dup2 <"); exit(1); }
+        close(fd_in);
+    }
+    if (outfile) {
+        int flags = O_WRONLY | O_CREAT | (append ? O_APPEND : O_TRUNC);
+        int fd_out = open(outfile, flags, 0644);
+        if (fd_out < 0) { perror("open >"); exit(1); }
+        if (dup2(fd_out, STDOUT_FILENO) < 0) { perror("dup2 >"); exit(1); }
+        close(fd_out);
+    }
+ 
+    // Close inherited pipe ends in the child
+    if (in_fd  != -1) close(in_fd);
+    if (out_fd != -1) close(out_fd);
+ 
+    if (cleanc == 0) exit(0);
+    execvp(clean_args[ARG_PROGNAME], clean_args);
+    perror("execvp failed");
+    exit(1);
+}
+
+//extras
+//pipeline
+
+bool command_has_pipe(const char *line) {
+    return line && strchr(line, '|') != NULL;
+}
+ 
+int split_pipeline(char *line, char *stages[], int max_stages)
+{
+    int n = 0;
+    char *saveptr = NULL;
+    char *tok = strtok_r(line, "|", &saveptr);
+    while (tok && n < max_stages) {
+        // trim leading spaces
+        while (*tok == ' ' || *tok == '\t') ++tok;
+        // trim trailing spaces
+        char *end = tok + strlen(tok) - 1;
+        while (end >= tok && (*end == ' ' || *end == '\t')) { *end = '\0'; --end; }
+        stages[n++] = tok;
+        tok = strtok_r(NULL, "|", &saveptr);
+    }
+    return n;
+}
+void launch_pipeline(char line[])
+{
+    char *stages[MAX_ARGS];           // generous bound
+    int num = split_pipeline(line, stages, MAX_ARGS);
+    if (num <= 0) return;
+ 
+    int prev_read_fd = -1;
+ 
+    for (int i = 0; i < num; ++i) {
+        int pipefd[2] = {-1, -1};
+        int out_fd = -1;
+ 
+        // Create pipe for all but last stage
+        if (i < num - 1) {
+            if (pipe(pipefd) < 0) { perror("pipe"); exit(1); }
+            out_fd = pipefd[1];
+        }
+ 
+        // Parse this stage into argv
+        char *args[MAX_ARGS];
+        int argsc = 0;
+        parse_command(stages[i], args, &argsc);
+        if (argsc == 0) {
+            if (pipefd[0] != -1) close(pipefd[0]);
+            if (pipefd[1] != -1) close(pipefd[1]);
+            if (prev_read_fd != -1) { close(prev_read_fd); prev_read_fd = -1; }
+            continue;
+        }
+ 
+        pid_t rc = fork();
+        if (rc < 0) { perror("fork"); exit(1); }
+        else if (rc == 0) {
+            // Child: close the unused read end if we created a pipe
+            if (pipefd[0] != -1) close(pipefd[0]);
+            // Wire prev_read_fd -> stdin, out_fd -> stdout, then apply <, >, >>
+            child_with_io_and_redirection(args, argsc, prev_read_fd, out_fd);
+            // no return
+        }
+ 
+        // Parent: manage fds for next iteration
+        if (prev_read_fd != -1) { close(prev_read_fd); prev_read_fd = -1; }
+        if (out_fd != -1) { close(out_fd); }
+        if (pipefd[0] != -1) prev_read_fd = pipefd[0];
+    }
+ 
+    // Parent returns; your main loop's reap() handles cleanup.
+}
 
 int execute_batch(char *line, char *lwd){
     enum { MAX_SEGS = 128 };
@@ -340,6 +485,12 @@ int execute_batch(char *line, char *lwd){
     for (int i = 0; i < n; ++i){
         char *args[MAX_ARGS];
         int argsc = 0;
+
+        if (command_has_pipe(line)){
+            launch_pipeline(line);
+            reap();
+            continue;
+        }
 
         if (is_cd(segments[i])) {
             parse_command(segments[i], args, &argsc);
@@ -353,6 +504,8 @@ int execute_batch(char *line, char *lwd){
             reap();
             continue;
         }
+
+
 
         parse_command(segments[i], args, &argsc);
         launch_program(args, argsc);
