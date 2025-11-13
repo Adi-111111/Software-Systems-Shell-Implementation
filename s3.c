@@ -1,6 +1,7 @@
 #include "s3.h"
 #include <errno.h>
 #include <limits.h>
+#include <ctype.h>
 
 ///Simple for now, but will be expanded in a following section
 void construct_shell_prompt(char shell_prompt[])
@@ -279,4 +280,84 @@ void run_cd(char *args[], int argsc, char *lwd)
         return;
     }
     snprintf(lwd, MAX_PROMPT_LEN - 6, "%s", old);
+}
+
+static char *ltrim_(char *s){
+    while (*s && isspace((unsigned char)*s)) s++;
+    return s;
+}
+static void rtrim_inplace_(char *s){
+    size_t n = strlen(s);
+    while (n && isspace((unsigned char)s[n-1])) s[--n] = '\0';
+}
+
+static int split_on_semicolons_(char *line, char *out[], int max_out){
+    int count = 0;
+    int in_single = 0;
+    int in_double = 0;
+    int escaped   = 0;
+    char *start = line;
+
+    for (char *p = line; ; ++p){
+        char c = *p;
+
+        if (escaped) {
+            escaped = 0; 
+            continue;
+        }
+        if (c == '\\') {
+            escaped = 1; 
+            continue;
+        }
+        if (c == '\'' && !in_double) {
+            in_single = !in_single; 
+            continue;
+        }
+        if (c == '\"' && !in_single) {
+            in_double = !in_double; 
+            continue;
+        }
+
+        if ((!in_single && !in_double && c == ';') || c == '\0'){
+            if (count < max_out){
+                *p = '\0';
+                char *seg = ltrim_(start);
+                rtrim_inplace_(seg);
+                if (*seg) out[count++] = seg;
+            }
+            if (c == '\0') break;
+            start = p + 1;
+        }
+    }
+    return count;
+}
+
+int execute_batch(char *line, char *lwd){
+    enum { MAX_SEGS = 128 };
+    char *segments[MAX_SEGS];
+    int n = split_on_semicolons_(line, segments, MAX_SEGS);
+
+    for (int i = 0; i < n; ++i){
+        char *args[MAX_ARGS];
+        int argsc = 0;
+
+        if (is_cd(segments[i])) {
+            parse_command(segments[i], args, &argsc);
+            run_cd(args, argsc, lwd);
+            continue;
+        }
+
+        if (command_with_redirection(segments[i])) {
+            parse_command(segments[i], args, &argsc);
+            launch_program_with_redirection(args, argsc);
+            reap();
+            continue;
+        }
+
+        parse_command(segments[i], args, &argsc);
+        launch_program(args, argsc);
+        reap();
+    }
+
+    return 0;
 }

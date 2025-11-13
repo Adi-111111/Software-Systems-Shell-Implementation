@@ -57,4 +57,6 @@ bool command_with_redirection(const char line[]);
 bool is_cd(const char *line);
 void run_cd(char *args[], int argsc, char *lwd);
 void init_lwd(char *lwd);
+
+int execute_batch(char *line, char *lwd);
 #endif
