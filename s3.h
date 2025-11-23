@@ -14,6 +14,7 @@
 #include <limits.h>
 
 
+
 ///Constants for array sizes, defined for clarity and code readability
 #define MAX_LINE 1024
 #define MAX_ARGS 128
@@ -67,4 +68,6 @@ void launch_pipeline(char line[]);
  
 //shared child w/ optional fds + redirection parsing ---
 void child_with_io_and_redirection(char *args[], int argsc, int in_fd, int out_fd);
+
+void s3_set_argv0(const char *argv0);
 #endif

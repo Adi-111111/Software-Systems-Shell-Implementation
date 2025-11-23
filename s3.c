@@ -2,6 +2,16 @@
 #include <errno.h>
 #include <limits.h>
 #include <ctype.h>
+#include <glob.h>
+#define MAX_JOBS 128
+typedef struct {
+    pid_t pid;
+    char  cmdline[256];
+    int   running;   // 1 = running, 0 = finished
+} Job;
+
+static Job jobs[MAX_JOBS];
+static int job_count = 0;
 
 ///Simple for now, but will be expanded in a following section
 void construct_shell_prompt(char shell_prompt[])
@@ -59,6 +69,47 @@ void child(char *args[], int argsc)
     ///For reference, see the code in lecture 3.
 }
 
+static int is_glob(const char *s) {
+    for (const char *p = s; *p; ++p) {
+        if (*p == '*' || *p == '?' || *p == '[') {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void expand_globs(char *args[], int *argsc) {
+    char *expanded[MAX_ARGS];
+    int newc = 0;
+
+    for (int i = 0; i < *argsc && newc < MAX_ARGS - 1; ++i) {
+        char *arg = args[i];
+
+        if (is_glob(arg)) {
+            glob_t g;
+            int r = glob(arg, GLOB_NOCHECK, NULL, &g);
+            if (r == 0) {
+                for (size_t j = 0; j < g.gl_pathc && newc < MAX_ARGS - 1; ++j) {
+                    expanded[newc++] = g.gl_pathv[j];
+                }
+                continue;
+            }
+        }
+
+        expanded[newc++] = arg;
+    }
+
+    // IMPORTANT: NULL-terminate
+    expanded[newc] = NULL;
+
+    // Copy back INCLUDING the NULL
+    for (int i = 0; i <= newc; ++i) {
+        args[i] = expanded[i];
+    }
+
+    *argsc = newc;
+}
+
 void launch_program(char *args[], int argsc)
 {
     ///Implement this function:
@@ -77,6 +128,8 @@ void launch_program(char *args[], int argsc)
     if (argsc > 0 && strcmp(args[0], "exit") == 0) {
         exit(0);
     }
+
+    expand_globs(args, &argsc);
 
     /// fork() a child process using the pattern from your example.
     pid_t rc = fork();
@@ -181,6 +234,9 @@ void launch_program_with_redirection(char *args[], int argsc) {
                 close(fd);
             }
         }
+
+        int cleanc_mut = cleanc;
+        expand_globs(clean_args, &cleanc_mut);
         execvp(clean_args[0], clean_args);
         perror("execvp failed");
         exit(1);
@@ -291,11 +347,31 @@ static void rtrim_inplace_(char *s){
     while (n && isspace((unsigned char)s[n-1])) s[--n] = '\0';
 }
 
+static bool strip_bg_flag(char *seg) {
+    char *end = seg + strlen(seg);
+    while (end > seg && isspace((unsigned char)end[-1])) {
+        --end;
+    }
+
+    if (end > seg && end[-1] == '&') {
+        --end;
+        while (end > seg && isspace((unsigned char)end[-1])) {
+            --end;
+        }
+
+        *end = '\0';
+        return true;
+    }
+
+    return false;
+}
+
 static int split_on_semicolons_(char *line, char *out[], int max_out){
     int count = 0;
     int in_single = 0;
     int in_double = 0;
     int escaped   = 0;
+    int paren_depth = 0;
     char *start = line;
 
     for (char *p = line; ; ++p){
@@ -318,7 +394,14 @@ static int split_on_semicolons_(char *line, char *out[], int max_out){
             continue;
         }
 
-        if ((!in_single && !in_double && c == ';') || c == '\0'){
+        // Track parentheses only when not in quotes
+        if (!in_single && !in_double) {
+            if (c == '(') paren_depth++;
+            else if (c == ')' && paren_depth > 0) paren_depth--;
+        }
+
+        // Only split on top-level semicolons
+        if ((!in_single && !in_double && paren_depth == 0 && c == ';') || c == '\0'){
             if (count < max_out){
                 *p = '\0';
                 char *seg = ltrim_(start);
@@ -330,6 +413,52 @@ static int split_on_semicolons_(char *line, char *out[], int max_out){
         }
     }
     return count;
+}
+
+static bool segment_is_subshell(char *seg, char **inner_out){
+    char *s = ltrim_(seg);
+    rtrim_inplace_(s);
+
+    if (*s != '(') return false;
+
+    int depth = 0;
+    char *p = s;
+    for (; *p; ++p) {
+        if (*p == '(') depth++;
+        else if (*p == ')') {
+            depth--;
+            if (depth == 0) {
+                // ensure only whitespace after this ')'
+                char *after = p + 1;
+                while (*after == ' ' || *after == '\t') after++;
+                if (*after != '\0') return false;
+
+                // terminate at this ')'
+                *p = '\0';
+                *inner_out = s + 1;  // skip '('
+                return true;
+            }
+        }
+    }
+    return false;  // no matching ')'
+}
+
+static void run_subshell_text(char *inner, int in_fd, int out_fd){
+    if (in_fd != -1) {
+        if (dup2(in_fd, STDIN_FILENO) < 0) { perror("dup2 stdin"); exit(1); }
+        close(in_fd);
+    }
+    if (out_fd != -1) {
+        if (dup2(out_fd, STDOUT_FILENO) < 0) { perror("dup2 stdout"); exit(1); }
+        close(out_fd);
+    }
+
+    char lwd_sub[MAX_PROMPT_LEN - 6];
+    init_lwd(lwd_sub);
+
+    // reuse the same shell logic recursively inside this child
+    execute_batch(inner, lwd_sub);
+    exit(0);
 }
 //ectras
 
@@ -401,6 +530,7 @@ void child_with_io_and_redirection(char *args[], int argsc, int in_fd, int out_f
     if (out_fd != -1) close(out_fd);
  
     if (cleanc == 0) exit(0);
+    expand_globs(clean_args, &cleanc);
     execvp(clean_args[ARG_PROGNAME], clean_args);
     perror("execvp failed");
     exit(1);
@@ -431,51 +561,58 @@ int split_pipeline(char *line, char *stages[], int max_stages)
 }
 void launch_pipeline(char line[])
 {
-    char *stages[MAX_ARGS];           // generous bound
+    char *stages[MAX_ARGS];          
     int num = split_pipeline(line, stages, MAX_ARGS);
     if (num <= 0) return;
- 
+
     int prev_read_fd = -1;
- 
+
     for (int i = 0; i < num; ++i) {
         int pipefd[2] = {-1, -1};
         int out_fd = -1;
- 
-        // Create pipe for all but last stage
+
         if (i < num - 1) {
             if (pipe(pipefd) < 0) { perror("pipe"); exit(1); }
             out_fd = pipefd[1];
         }
- 
-        // Parse this stage into argv
+
+        char *stage = stages[i];
         char *args[MAX_ARGS];
         int argsc = 0;
-        parse_command(stages[i], args, &argsc);
-        if (argsc == 0) {
+        char *inner = NULL;
+        bool is_sub = segment_is_subshell(stage, &inner);
+        if (!is_sub) {
+            parse_command(stage, args, &argsc);
+        }
+
+        if (!is_sub && argsc == 0) {
             if (pipefd[0] != -1) close(pipefd[0]);
             if (pipefd[1] != -1) close(pipefd[1]);
             if (prev_read_fd != -1) { close(prev_read_fd); prev_read_fd = -1; }
             continue;
         }
- 
+
         pid_t rc = fork();
         if (rc < 0) { perror("fork"); exit(1); }
         else if (rc == 0) {
-            // Child: close the unused read end if we created a pipe
             if (pipefd[0] != -1) close(pipefd[0]);
-            // Wire prev_read_fd -> stdin, out_fd -> stdout, then apply <, >, >>
-            child_with_io_and_redirection(args, argsc, prev_read_fd, out_fd);
-            // no return
+
+            if (is_sub) {
+                run_subshell_text(inner, prev_read_fd, out_fd);
+            } else {
+                child_with_io_and_redirection(args, argsc, prev_read_fd, out_fd);
+            }
+
         }
- 
-        // Parent: manage fds for next iteration
+
         if (prev_read_fd != -1) { close(prev_read_fd); prev_read_fd = -1; }
         if (out_fd != -1) { close(out_fd); }
         if (pipefd[0] != -1) prev_read_fd = pipefd[0];
     }
- 
-    // Parent returns; your main loop's reap() handles cleanup.
+
+
 }
+
 
 int execute_batch(char *line, char *lwd){
     enum { MAX_SEGS = 128 };
@@ -483,33 +620,54 @@ int execute_batch(char *line, char *lwd){
     int n = split_on_semicolons_(line, segments, MAX_SEGS);
 
     for (int i = 0; i < n; ++i){
+        char *seg = segments[i];
         char *args[MAX_ARGS];
         int argsc = 0;
+        char *inner = NULL;
 
-        if (command_has_pipe(line)){
-            launch_pipeline(line);
-            reap();
+        bool bg = strip_bg_flag(seg);
+
+        if (segment_is_subshell(seg, &inner)) {
+            pid_t rc = fork();
+            if (rc < 0) {
+                perror("fork");
+            } else if (rc == 0) {
+                run_subshell_text(inner, -1, -1);
+            }
+            if (!bg) {
+                reap();
+            }
             continue;
         }
 
-        if (is_cd(segments[i])) {
-            parse_command(segments[i], args, &argsc);
+        if (command_has_pipe(seg)){
+            launch_pipeline(seg);
+            if (!bg) {
+                reap();
+            }
+            continue;
+        }
+
+        if (is_cd(seg)) {
+            parse_command(seg, args, &argsc);
             run_cd(args, argsc, lwd);
             continue;
         }
 
-        if (command_with_redirection(segments[i])) {
-            parse_command(segments[i], args, &argsc);
+        if (command_with_redirection(seg)) {
+            parse_command(seg, args, &argsc);
             launch_program_with_redirection(args, argsc);
-            reap();
+            if (!bg) {
+                reap();
+            }
             continue;
         }
 
-
-
-        parse_command(segments[i], args, &argsc);
+        parse_command(seg, args, &argsc);
         launch_program(args, argsc);
-        reap();
+        if (!bg) {
+            reap();
+        }
     }
 
     return 0;
